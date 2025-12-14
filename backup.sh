@@ -2,7 +2,7 @@
 
 #BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-CONFIG_DIR="/home/dawid/backup_project"
+CONFIG_DIR="$HOME/backup_project"
 CONFIG_FILE="$CONFIG_DIR/backup.conf"
 
 LOCK_FILE="$CONFIG_DIR/backup.lock"
