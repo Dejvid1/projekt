@@ -1,0 +1,2 @@
+Test widocznosci w logach
+Kolejna proba z flaga v

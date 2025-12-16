@@ -1,156 +1,218 @@
 #!/bin/bash
-
-#BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
+set -u
 
 CONFIG_DIR="$HOME/backup_project"
 CONFIG_FILE="$CONFIG_DIR/backup.conf"
-
 LOCK_FILE="$CONFIG_DIR/backup.lock"
 
-
-#LOG_FILE="$CONFIG_DIR/logs/run.log"
-
-if [ -f "$LOCK_FILE" ]; then 
-	echo "Skrypt juz jest uruchomiony"
-	exit 1
-fi	
+if [ -f "$LOCK_FILE" ]; then
+    echo "Skrypt juz jest uruchomiony (plik lock istnieje)."
+    exit 1
+fi
 touch "$LOCK_FILE"
 
 trap 'rm -f "$LOCK_FILE"' EXIT
 
-mkdir -p "$CONFIG_DIR/logs"
-
-if [ ! -f "$CONFIG_FILE" ];  then
-	echo "brak pliku konfiguracyjnego $CONFIG_FILE"
-	exit 1
-fi 
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "Blad: Brak pliku konfiguracyjnego $CONFIG_FILE"
+    exit 1
+fi
 
 source "$CONFIG_FILE"
 
 CURRENT_TIME=$(date "+%Y-%m-%d %H:%M:%S")
 CURRENT_PERIOD=$(date "+$PERIOD_FORMAT")
-LOG_FILE="$LOG_DIR/log_$CURRENT_PERIOD.txt"
-log(){
-	local MESS=$1
-	local TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
-	echo "$TIMESTAMP $MESS" >> "$LOG_FILE"
-	if [ -t 1 ]; then echo "$TIMESTAMP $MESS"; fi
-}
-synchronizuj_katalogi() {
-    local zrodlo="$1"
-    local cel="$2"
+LOG_FILE="$LOG_DIR/log_$(date +%F).txt"
 
-    if [[ ! -d "$zrodlo" ]]; then
-        log "Błąd: Katalog źródłowy '$zrodlo' nie istnieje!"
+mkdir -p "$LOG_DIR"
+mkdir -p "$TEMP_DIR"
+
+log() {
+    local MESS=$1
+    local TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
+    echo "$TIMESTAMP $MESS" >> "$LOG_FILE"
+    if [ -t 1 ]; then echo "$TIMESTAMP $MESS"; fi
+}
+
+check_space_on_disk() {
+    if [ ! -d "$LOCAL_BACKUP_BASE" ]; then
+        mkdir -p "$LOCAL_BACKUP_BASE"
+    fi
+    
+    local required=${MIN_DISK_SPACE_MB:-100}
+    local available=$(df -m "$LOCAL_BACKUP_BASE" | awk 'NR==2 {print $4}')
+
+    log "Dysk: Dostepne ${available} MB (Wymagane: ${required} MB)"
+
+    if [[ "$available" -lt "$required" ]]; then
+        log "BLAD KRYTYCZNY: Za malo miejsca na dysku! Przerywam."
+        return 1
+    fi
+    return 0
+}
+
+check_remote_host() {
+    log "Sprawdzanie dostepnosci hosta zdalnego: $REMOTE_HOST..."
+    
+    ping -c 1 -W 2 "$REMOTE_HOST" > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        log "BLAD: Host zdalny $REMOTE_HOST nie odpowiada na ping."
         return 1
     fi
 
-    if [[ ! -d "$cel" ]]; then
-        log "Tworzę katalog docelowy: '$cel'"
-        mkdir -p "$cel"
+    ssh -p "$REMOTE_PORT" -q -o ConnectTimeout=5 "$REMOTE_USER@$REMOTE_HOST" exit
+    if [ $? -ne 0 ]; then
+        log "BLAD: Nie mozna nawiazac polaczenia SSH z $REMOTE_HOST."
+        return 1
     fi
 
-    log "Rozpoczynam synchronizację: '$zrodlo' -> '$cel'"
+    log "SUKCES: Host zdalny dostepny."
+    return 0
+}
 
-    # rsync: -rlptgo (bez -D dla device/specials), --delete (usuwanie), verbose
-    rsync -rlptgo --delete --verbose "$zrodlo/" "$cel/"
+synchronize_dir() {
+    local source="$1"
+    local target="$2"
+
+    if [[ ! -d "$source" ]]; then
+        log "Blad: Katalog zrodlowy '$source' nie istnieje!"
+        return 1
+    fi
+
+    if [[ ! -d "$target" ]]; then
+        mkdir -p "$target"
+    fi
+
+    log "Rozpoczynam synchronizacje rsync (katalog): '$source' -> '$target'"
+
+    rsync -rlptgo -v  --delete $EXCLUDE_PARAMS "$source/" "$target/" >> "$LOG_FILE" 2>&1
 
     if [ $? -ne 0 ]; then
-        log "Błąd krytyczny rsync!"
+        log "Blad krytyczny rsync!"
         return 1
     fi
 
-    log "Synchronizacja rsync zakończona. Weryfikacja diff..."
-
-    # Test różnicowy (pomijamy sockety i fifo w wynikach grepa)
-    DIFF_OUT=$(diff -r -q "$zrodlo" "$cel" 2>/dev/null | grep -vE "socket|fifo")
-    
-    if [ -z "$DIFF_OUT" ]; then
-        log "SUKCES: Katalogi są zsynchronizowane."
-    else
-        log "UWAGA: Wykryto różnice:"
-        echo "$DIFF_OUT"
-    fi
+    log "Synchronizacja rsync zakonczona."
 }
 
-obsluga_git() {
-    local url_repo="$1"
-    local katalog_docelowy="$2"
+synchronize_git() {
+    local source_path="$1"
+    local target_dir="$2"
 
-    # 1. Sprawdzenie czy katalog istnieje i czy to repozytorium GIT (Wykrywanie)
-    if [ -d "$katalog_docelowy/.git" ]; then
-        log "Wykryto istniejące repozytorium w: $katalog_docelowy"
-        log "Rozpoczynam aktualizację (git pull)..."
+    
+    if [ ! -d "$target_dir" ]; then
+        mkdir -p "$target_dir"
+    fi
 
-        # Przejście do katalogu, wykonanie pull i powrót
-        # Używamy nawiasów ( ... ), żeby zmiana katalogu była tylko lokalna dla tych komend
+    
+    if [ -f "$target_dir/HEAD" ] || [ -d "$target_dir/.git" ]; then
+        log "Aktualizacja istniejacego repozytorium w: $target_dir"
         (
-            cd "$katalog_docelowy" || exit
-            git pull
+            cd "$target_dir" || exit
+            git remote update >> "$LOG_FILE" 2>&1
         )
-
         if [ $? -eq 0 ]; then
             log "SUKCES: Repozytorium zaktualizowane."
         else
-            log "BŁĄD: Nie udało się zaktualizować repozytorium."
+            log "BLAD: Nie udalo sie zaktualizowac repozytorium."
         fi
-
-    elif [ -d "$katalog_docelowy" ]; then
-        # Katalog istnieje, ale nie ma tam .git
-        log "BŁĄD: Katalog '$katalog_docelowy' istnieje, ale to nie jest repozytorium Git! Pomijam."
     else
-        # 2. Katalog nie istnieje -> Klonowanie
-        log "Katalog nie istnieje. Rozpoczynam klonowanie (git clone)..."
-        git clone "$url_repo" "$katalog_docelowy"
+        
+        log "Klonowanie nowego repozytorium (mirror) do: $target_dir"
+        
+        
+        rmdir "$target_dir" 2>/dev/null 
 
+        git clone --mirror "$source_path" "$target_dir" >> "$LOG_FILE" 2>&1
         if [ $? -eq 0 ]; then
-            log "SUKCES: Repozytorium sklonowane do '$katalog_docelowy'."
+            log "SUKCES: Repozytorium sklonowane."
         else
-            log "BŁĄD: Nie udało się sklonować repozytorium."
+            log "BLAD: Nie udalo sie sklonowac repozytorium."
         fi
     fi
 }
-mkdir -p "$LOG_DIR"
 
-log "start"
+archive_previous_periods() {
+    log "Sprawdzanie czy istnieja stare okresy do archiwizacji..."
+    
+    find "$LOCAL_BACKUP_BASE" -maxdepth 1 -mindepth 1 -type d | while read dir_path; do
+        local dir_name=$(basename "$dir_path")
+        
+        if [ "$dir_name" == "$CURRENT_PERIOD" ]; then
+            continue
+        fi
 
-while true; do
-    echo "----------------------------------------"
-    echo "MENU GŁÓWNE BACKUPU:"
-    echo "1. Synchronizacja katalogów"
-    echo "2. Rezpoztoria Git clone/pull"
-    echo "0. Wyjście"
-    echo "----------------------------------------"
-    read -p "Wybierz opcję: " opcja
+        log "Wykryto zakonczony okres: $dir_name. Rozpoczynam archiwizacje."
 
-    case "$opcja" in
-        1)
-            echo "--- Synchronizacja Katalogów ---"
-            read -p "Podaj katalog źródłowy: " src
-            read -p "Podaj katalog docelowy: " dst
-            # Wywołanie funkcji zdefiniowanej wyżej
-            synchronizuj_katalogi "$src" "$dst"
-            ;;
-        2)
-            echo "--- Obsługa Repozytoriów Git ---"
-            read -p "Podaj URL repozytorium (np. https://github.com/...): " repo_url
-            read -p "Podaj katalog docelowy (ścieżka lokalna): " repo_dir
+        if ! check_remote_host; then
+            log "BLAD: Pomijam archiwizacje $dir_name z powodu braku polaczenia."
+            continue
+        fi
 
-            if [ -z "$repo_url" ] || [ -z "$repo_dir" ]; then
-                echo "Błąd: Musisz podać URL i katalog."
-            else
-                obsluga_git "$repo_url" "$repo_dir"
-            fi
-            ;;
-        0)
-            echo "Kończenie pracy..."
-            break
-            ;;
-        *)
-            echo "Nieprawidłowa opcja, spróbuj ponownie."
-            ;;
-    esac
+        local archive_name="backup_${dir_name}.tar.gz"
+        local archive_path="$TEMP_DIR/$archive_name"
+
+        log "Kompresja katalogu: $dir_path -> $archive_path"
+        tar -czf "$archive_path" -C "$LOCAL_BACKUP_BASE" "$dir_name" >> "$LOG_FILE" 2>&1
+
+        if [ $? -ne 0 ]; then
+            log "BLAD: Kompresja nie powiodla sie."
+            rm -f "$archive_path"
+            continue
+        fi
+
+        log "Wysylanie archiwum na zdalny host..."
+        ssh -p "$REMOTE_PORT" "$REMOTE_USER@$REMOTE_HOST" "mkdir -p $REMOTE_DEST_DIR"
+        scp -P "$REMOTE_PORT" "$archive_path" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_DEST_DIR/" >> "$LOG_FILE" 2>&1
+
+        if [ $? -eq 0 ]; then
+            log "SUKCES: Archiwum wyslane. Usuwanie kopii lokalnej i tymczasowej."
+            rm -rf "$dir_path"
+            rm -f "$archive_path"
+        else
+            log "BLAD: Nie udalo sie wyslac archiwum. Pozostawiam dane lokalnie."
+        fi
+    done
+}
+
+log "--- START SKRYPTU BACKUPU: $CURRENT_TIME ---"
+
+if ! check_space_on_disk; then 
+    exit 1
+fi
+
+CURRENT_PERIOD_DIR="$LOCAL_BACKUP_BASE/$CURRENT_PERIOD"
+REPO_DEST_BASE="$CURRENT_PERIOD_DIR/repozytoria"
+FILES_DEST_BASE="$CURRENT_PERIOD_DIR/zasoby_archiwalne"
+
+if [ ! -d "$CURRENT_PERIOD_DIR" ]; then
+    log "Tworzenie struktury katalogow dla nowego okresu: $CURRENT_PERIOD"
+    mkdir -p "$CURRENT_PERIOD_DIR"
+    mkdir -p "$REPO_DEST_BASE"
+    mkdir -p "$FILES_DEST_BASE"
+fi
+
+for src in "${SOURCES[@]}"; do
+    if [ -z "$src" ]; then continue; fi
+
+    dir_name=$(basename "$src")
+    
+    if [[ "$dir_name" == *" "* ]]; then
+        log "UWAGA: Nazwa katalogu zawiera spacje: '$dir_name'. Przetwarzam bezpiecznie."
+    fi
+
+    if [ -d "$src/.git" ]; then
+        dst="$REPO_DEST_BASE/$dir_name.git"
+        log "Zadanie: Synchronizacja repozytorium GIT: $src"
+        synchronize_git "$src" "$dst"
+    else
+        dst="$FILES_DEST_BASE/$dir_name"
+        log "Zadanie: Synchronizacja katalogu plikow: $src"
+        synchronize_dir "$src" "$dst"
+    fi
 done
 
-echo "h"
-log "stop"
+archive_previous_periods
+
+rm -f "$LOCK_FILE"
+log "--- STOP SKRYPTU BACKUPU ---"
